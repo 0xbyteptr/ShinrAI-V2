@@ -478,25 +478,27 @@ class ResponseGenerator:
         if not context:
             return random.choice(self.response_templates['uncertain'])
 
-        # Clean and format the context
-        cleaned_context = self._clean_text(context[0])
+        # Combine top candidate contexts to reduce single-document bias.
+        cleaned_contexts = [self._clean_text(ctx) for ctx in context[:3]]
+        merged = " ".join(cleaned_contexts)
+
         # treat trivial dictionary-like entries (e.g. "crack B2" or "first name A2") as unhelpful
-        if re.match(r'^[A-Za-z ]+\s+[A-Z]\d$', cleaned_context):
+        if re.match(r'^[A-Za-z ]+\s+[A-Z]\d$', merged):
             return random.choice(self.response_templates['uncertain'])
-        
+
         # Extract key sentences related to the question
-        key_sentences = self._extract_key_sentences(cleaned_context, query, max_sentences=3)
+        key_sentences = self._extract_key_sentences(merged, query, max_sentences=3)
         
         if key_sentences:
             # Join sentences with proper spacing
             response_text = ' '.join(key_sentences)
         else:
             # Take first part of the context
-            words = cleaned_context.split()
+            words = merged.split()
             if len(words) > 100:
                 response_text = ' '.join(words[:100]) + "..."
             else:
-                response_text = cleaned_context
+                response_text = merged
         
         # Remove duplicates
         sentences = response_text.split('. ')
@@ -510,9 +512,8 @@ class ResponseGenerator:
         response_text = '. '.join(unique_sentences)
         
         # Choose an appropriate intro
-        if "what is" in query:
+        if "what is" in query or query.startswith("define "):
             intro = random.choice([
-                f"A {query.replace('what is', '').strip()} is ",
                 f"Here's the definition: ",
                 f"According to what I know, "
             ])
@@ -564,8 +565,8 @@ class ResponseGenerator:
         """Generate factual response with better formatting"""
         if not context:
             return random.choice(self.response_templates['uncertain'])
-        
-        cleaned = self._clean_text(context[0])
+
+        cleaned = self._clean_text(" ".join(context[:3]))
         
         # Extract a concise answer
         try:
@@ -574,13 +575,14 @@ class ResponseGenerator:
             sentences = cleaned.split('. ')
         
         # Try to find sentences that directly answer the query
-        query_words = set(query.lower().split())
+        query_words = set(self._normalize_query_terms(query))
         relevant_sentences = []
         
         for sent in sentences[:5]:  # Check first 5 sentences
             sent_lower = sent.lower()
             # Check if sentence contains key words from query
-            word_overlap = len(query_words.intersection(set(sent_lower.split())))
+            sent_terms = set(self._normalize_query_terms(sent_lower))
+            word_overlap = len(query_words.intersection(sent_terms))
             if word_overlap > 1:
                 relevant_sentences.append(sent)
         
@@ -626,17 +628,24 @@ class ResponseGenerator:
         except:
             sentences = text.split('. ')
         
-        query_words = set(query.lower().split())
+        query_words = set(self._normalize_query_terms(query))
         scored_sentences = []
         
         for idx, sent in enumerate(sentences):
             sent_lower = sent.lower()
+            sent_terms = set(self._normalize_query_terms(sent_lower))
             # Score based on word overlap and position
-            word_overlap = len(query_words.intersection(set(sent_lower.split())))
+            word_overlap = len(query_words.intersection(sent_terms))
             
             # Boost score if sentence contains definition patterns
             if any(pattern in sent_lower for pattern in ['is a', 'refers to', 'defined as', 'means']):
                 word_overlap += 2
+
+            # Penalize question-like lines and quiz prompts often present in datasets
+            if sent.strip().endswith('?'):
+                word_overlap -= 2
+            if any(marker in sent_lower for marker in ['question:', 'answer:', 'quiz', 'choose one']):
+                word_overlap -= 2
             
             # Boost score for first sentence (often contains definition)
             if idx == 0:
@@ -654,6 +663,18 @@ class ResponseGenerator:
         
         # Return top sentences
         return [sent for score, idx, sent in scored_sentences[:max_sentences]]
+
+    def _normalize_query_terms(self, text: str) -> List[str]:
+        """Normalize text into lightweight content-bearing terms."""
+        tokens = re.findall(r"[a-z0-9]+", text.lower())
+        stop = {
+            'the', 'a', 'an', 'of', 'to', 'in', 'on', 'at', 'for', 'and', 'or',
+            'is', 'are', 'was', 'were', 'be', 'been', 'being', 'do', 'does',
+            'did', 'what', 'why', 'how', 'when', 'where', 'who', 'which',
+            'can', 'could', 'would', 'should', 'tell', 'give', 'show', 'about',
+            'me', 'you', 'your', 'my', 'i'
+        }
+        return [tok for tok in tokens if len(tok) > 2 and tok not in stop]
     
     def _add_personality(self, response: str, conversation_memory) -> str:
         """Add personality to response based on conversation context"""
