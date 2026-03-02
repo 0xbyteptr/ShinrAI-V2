@@ -20,7 +20,6 @@ quick sanity check when inspecting or debugging the model directory.
 """
 
 import sys
-from pathlib import Path
 
 from shinrai.core import Shinrai
 
@@ -56,10 +55,21 @@ def main():
         print(f"Vocabulary size: {vocab_size}")
 
         if num_docs:
-            enc = tok(shinrai.documents, truncation=False, padding=False)
-            all_ids = enc.get('input_ids', [])
-            total_tokens = sum(len(ids) for ids in all_ids)
-            unique_tokens = len(set(tok_id for seq in all_ids for tok_id in seq))
+            total_tokens = 0
+            unique_token_ids = set()
+            for doc in shinrai.documents:
+                enc = tok(
+                    doc,
+                    truncation=False,
+                    padding=False,
+                    add_special_tokens=False,
+                    verbose=False,
+                )
+                ids = enc.get('input_ids', [])
+                total_tokens += len(ids)
+                unique_token_ids.update(ids)
+
+            unique_tokens = len(unique_token_ids)
             print(f"Total tokens across documents: {total_tokens} ({human_format(total_tokens)})")
             print(f"Unique token ids in corpus: {unique_tokens}")
         else:

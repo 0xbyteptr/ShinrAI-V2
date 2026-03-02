@@ -17,6 +17,53 @@ from .response import ResponseGenerator
 from .scraper import WebScraper
 from .utils import DEVICE, logger
 
+
+class _HFEncoderFallback:
+    """Lightweight text encoder fallback using Hugging Face AutoModel.
+
+    This mirrors the minimal `.encode(...)` API used in this codebase so we can
+    keep training/retrieval functional on GPU even when sentence-transformers
+    fails to import in the runtime environment.
+    """
+
+    def __init__(self, model_name: str = 'bert-base-uncased'):
+        from transformers import AutoModel, AutoTokenizer
+
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModel.from_pretrained(model_name).to(DEVICE)
+        self.model.eval()
+        self.device = DEVICE
+
+    def encode(self, texts, convert_to_tensor: bool = True, device: str = None):
+        if isinstance(texts, str):
+            texts = [texts]
+
+        target_device = torch.device(device) if device else self.device
+        if self.device != target_device:
+            self.model = self.model.to(target_device)
+            self.device = target_device
+
+        encoded = self.tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=512,
+            return_tensors='pt'
+        )
+        encoded = {k: v.to(self.device) for k, v in encoded.items()}
+
+        with torch.no_grad():
+            outputs = self.model(**encoded)
+            token_embeddings = outputs.last_hidden_state
+            attention_mask = encoded['attention_mask'].unsqueeze(-1)
+            summed = (token_embeddings * attention_mask).sum(dim=1)
+            counts = attention_mask.sum(dim=1).clamp(min=1)
+            embeddings = summed / counts
+
+        if convert_to_tensor:
+            return embeddings
+        return embeddings.detach().cpu().numpy()
+
 class Shinrai:
     """Advanced uncensored AI chatbot"""
 
@@ -98,6 +145,11 @@ class Shinrai:
         the weights have been pulled they are stored in the cache and future
         instantiations – even in new processes – will not re‑download them.
         """
+        # Some environments ship incompatible torchvision builds (e.g. missing
+        # InterpolationMode) which can break sentence-transformers import even
+        # though we don't need vision features for text embeddings.
+        os.environ.setdefault('TRANSFORMERS_NO_TORCHVISION', '1')
+
         # load the sentence transformer; failure shouldn't prevent tokenizer
         model_name = 'sentence-transformers/all-MiniLM-L6-v2'
         try:
@@ -119,6 +171,14 @@ class Shinrai:
         except Exception as e:
             logger.error(f"Error loading sentence transformer: {e}")
             self.transformer_model = None
+
+            # Fallback: use plain HF AutoModel-based encoder on GPU
+            try:
+                self.transformer_model = _HFEncoderFallback('bert-base-uncased')
+                logger.info("Loaded fallback HF encoder: bert-base-uncased")
+            except Exception as fallback_error:
+                logger.error(f"Error loading fallback HF encoder: {fallback_error}")
+                self.transformer_model = None
 
         # load tokenizer separately so that transformer failures don't block it
         try:
