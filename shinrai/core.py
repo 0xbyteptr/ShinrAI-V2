@@ -7,6 +7,8 @@ from pathlib import Path
 from datetime import datetime
 from typing import List
 import re
+from urllib.parse import urlparse
+import requests
 import torch
 import torch.nn.functional as F
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -229,6 +231,11 @@ class Shinrai:
         # ensure that models are ready before touching embeddings
         self._ensure_models()
         logger.info(f"Starting training; using device {DEVICE}")
+
+        # Auto-detect Hugging Face dataset URLs even if caller passes source_type='web'.
+        if source_type == 'web' and self._looks_like_hf_dataset_source(data_source):
+            source_type = 'hf_dataset'
+
         # Collect data
         if source_type == 'web':
             # reset scraper state so repeated calls fetch again
@@ -258,6 +265,10 @@ class Shinrai:
             texts = self._load_from_directory(data_source)
             if not texts:
                 logger.warning(f"No text loaded from directory {data_source}")
+        elif source_type == 'hf_dataset':
+            texts = self._load_from_hf_dataset(data_source, max_rows=kwargs.get('max_rows', 2000))
+            if not texts:
+                logger.warning(f"No text loaded from Hugging Face dataset source {data_source}")
         else:
             raise ValueError(f"Unknown source type: {source_type}")
 
@@ -282,6 +293,169 @@ class Shinrai:
         # Save model
         self.save_model()
         logger.info(f"Training complete. Total documents: {len(self.documents)}")
+
+    def _looks_like_hf_dataset_source(self, source: str) -> bool:
+        """Return True if *source* appears to be a Hugging Face dataset URL/id."""
+        s = (source or '').strip().lower()
+        if not s:
+            return False
+        if s.startswith('hf.co/') or s.startswith('https://hf.co/') or s.startswith('http://hf.co/'):
+            return True
+        if 'huggingface.co/datasets/' in s:
+            return True
+        # raw dataset repo id like "owner/dataset-name"
+        if '/' in s and not s.startswith(('http://', 'https://')) and len(s.split('/')) == 2:
+            return True
+        return False
+
+    def _normalize_hf_dataset_id(self, source: str) -> str:
+        """Normalize URL/slug to canonical HF dataset id (owner/dataset)."""
+        value = (source or '').strip()
+        if not value:
+            return ''
+
+        if value.startswith('hf.co/'):
+            value = 'https://' + value
+
+        if value.startswith(('http://', 'https://')):
+            parsed = urlparse(value)
+            parts = [p for p in parsed.path.split('/') if p]
+            host = parsed.netloc.lower()
+
+            if host.endswith('huggingface.co') and parts[:1] == ['datasets']:
+                parts = parts[1:]
+
+            if host.endswith('hf.co'):
+                # hf.co/<owner>/<dataset>
+                pass
+
+            if len(parts) >= 2:
+                return f"{parts[0]}/{parts[1]}"
+            return ''
+
+        parts = [p for p in value.split('/') if p]
+        if len(parts) >= 2:
+            return f"{parts[0]}/{parts[1]}"
+        return ''
+
+    def _load_from_hf_dataset(self, source: str, max_rows: int = 2000) -> List[str]:
+        """Load text rows from a Hugging Face dataset via datasets-server API."""
+        dataset_id = self._normalize_hf_dataset_id(source)
+        if not dataset_id:
+            logger.warning(f"Could not parse Hugging Face dataset id from source: {source}")
+            return []
+
+        max_rows = max(1, int(max_rows))
+        logger.info(f"Loading Hugging Face dataset: {dataset_id} (max_rows={max_rows})")
+
+        texts: List[str] = []
+        session = requests.Session()
+
+        try:
+            splits_resp = session.get(
+                "https://datasets-server.huggingface.co/splits",
+                params={"dataset": dataset_id},
+                timeout=30,
+            )
+            splits_resp.raise_for_status()
+            splits_data = splits_resp.json()
+            splits = splits_data.get('splits', [])
+        except Exception as e:
+            logger.error(f"Failed to fetch splits for dataset {dataset_id}: {e}")
+            return []
+
+        if not splits:
+            logger.warning(f"No splits found for dataset {dataset_id}")
+            return []
+
+        # Prefer larger splits first.
+        try:
+            splits = sorted(splits, key=lambda s: int(s.get('num_rows') or 0), reverse=True)
+        except Exception:
+            pass
+
+        rows_collected = 0
+        metadata_entries = []
+
+        for split_info in splits:
+            if rows_collected >= max_rows:
+                break
+
+            config = split_info.get('config')
+            split_name = split_info.get('split')
+            if not config or not split_name:
+                continue
+
+            offset = 0
+            while rows_collected < max_rows:
+                batch_len = min(100, max_rows - rows_collected)
+                params = {
+                    "dataset": dataset_id,
+                    "config": config,
+                    "split": split_name,
+                    "offset": offset,
+                    "length": batch_len,
+                }
+
+                rows = []
+                try:
+                    rows_resp = session.get(
+                        "https://datasets-server.huggingface.co/rows",
+                        params=params,
+                        timeout=30,
+                    )
+                    if rows_resp.ok:
+                        rows = rows_resp.json().get('rows', [])
+                except Exception:
+                    rows = []
+
+                # Fallback for datasets-server variants that only expose first-rows.
+                if not rows and offset == 0:
+                    try:
+                        fallback_resp = session.get(
+                            "https://datasets-server.huggingface.co/first-rows",
+                            params=params,
+                            timeout=30,
+                        )
+                        if fallback_resp.ok:
+                            rows = fallback_resp.json().get('rows', [])
+                    except Exception:
+                        rows = []
+
+                if not rows:
+                    break
+
+                added_this_batch = 0
+                for row in rows:
+                    payload = row.get('row', row)
+                    flat = self._flatten_json(payload).strip()
+                    if not flat:
+                        continue
+                    texts.append(flat)
+                    metadata_entries.append({
+                        'url': f'https://hf.co/datasets/{dataset_id}',
+                        'source': 'hf_dataset',
+                        'dataset': dataset_id,
+                        'config': config,
+                        'split': split_name,
+                    })
+                    rows_collected += 1
+                    added_this_batch += 1
+                    if rows_collected >= max_rows:
+                        break
+
+                if added_this_batch == 0:
+                    break
+
+                offset += len(rows)
+                if len(rows) < batch_len:
+                    break
+
+        if metadata_entries:
+            self.document_metadata.extend(metadata_entries)
+
+        logger.info(f"Loaded {len(texts)} text rows from Hugging Face dataset {dataset_id}")
+        return texts
 
     def _load_from_file(self, path: str) -> List[str]:
         """Load text data from a single file.
@@ -664,39 +838,107 @@ class Shinrai:
             sys.exit(0)
 
     def _get_relevant_documents(self, query: str, top_k: int = 5) -> List[str]:
-        """Get most relevant documents for query"""
-        # embeddings require models, so initialize if necessary
+        """Get most relevant documents for query using hybrid retrieval.
+
+        We combine semantic similarity (when available) with lexical overlap
+        and metadata URL boosts to avoid drifting into unrelated old documents
+        in large mixed corpora.
+        """
         self._ensure_models()
-        # if the transformer model failed to load, skip retrieval entirely
-        if self.transformer_model is None or self.embeddings is None:
-            # fallback: return first few documents without any similarity ranking
-            return self.documents[:top_k] if self.documents else []
 
-        try:
-            # Encode query
-            query_embedding = self.transformer_model.encode([query], convert_to_tensor=True)
-            query_embedding = query_embedding.to(DEVICE)
-        except Exception as e:
-            logger.error(f"Failed to encode query for retrieval: {e}")
-            return self.documents[:top_k] if self.documents else []
+        if not self.documents:
+            return []
 
-        # Calculate similarities
-        similarities = F.cosine_similarity(query_embedding, self.embeddings)
+        query_terms = [t for t in re.findall(r"[a-z0-9]+", query.lower()) if len(t) >= 3]
+        query_term_set = set(query_terms)
+        raw_query = query.lower().strip()
 
-        # Get top-k indices
-        top_scores, top_indices = torch.topk(similarities, min(top_k * 2, len(similarities)))
+        # document_metadata typically corresponds to the most recently appended
+        # web documents; map indices carefully when lengths differ.
+        meta_start_idx = len(self.documents) - len(self.document_metadata)
 
-        # Filter by threshold (lowered for broader recall)
-        threshold = 0.1
-        relevant_docs = []
+        def metadata_for_doc(doc_idx: int):
+            if doc_idx < meta_start_idx:
+                return None
+            rel_idx = doc_idx - meta_start_idx
+            if 0 <= rel_idx < len(self.document_metadata):
+                return self.document_metadata[rel_idx]
+            return None
 
-        for score, idx in zip(top_scores, top_indices):
-            if score > threshold:
-                relevant_docs.append(self.documents[idx])
-            if len(relevant_docs) >= top_k:
-                break
+        def lexical_score(doc_idx: int) -> float:
+            doc = self.documents[doc_idx]
+            text = doc.lower()
+            sample = text[:4000]
 
-        return relevant_docs if relevant_docs else [self.documents[top_indices[0]]]
+            score = 0.0
+            if raw_query and raw_query in sample:
+                score += 8.0
+
+            overlap = 0
+            for term in query_term_set:
+                if term in sample:
+                    overlap += 1
+            score += overlap * 1.8
+
+            # boost docs from matching source URLs when metadata is available
+            meta = metadata_for_doc(doc_idx)
+            if isinstance(meta, dict):
+                meta_url = str(meta.get('url', '')).lower()
+                if meta_url:
+                    url_hits = sum(1 for term in query_term_set if term in meta_url)
+                    score += url_hits * 1.2
+
+            # slight preference for newer documents (recently appended)
+            recency_rank = (doc_idx + 1) / max(1, len(self.documents))
+            score += recency_rank * 0.3
+
+            return score
+
+        candidate_scores = {}
+        candidate_pool = set()
+
+        # semantic retrieval path (if available)
+        if self.transformer_model is not None and self.embeddings is not None:
+            try:
+                query_embedding = self.transformer_model.encode([query], convert_to_tensor=True)
+                query_embedding = query_embedding.to(DEVICE)
+
+                # protect against embedding dimension mismatches
+                if query_embedding.shape[-1] == self.embeddings.shape[-1]:
+                    similarities = F.cosine_similarity(query_embedding, self.embeddings)
+                    top_n = min(max(top_k * 12, 30), len(similarities))
+                    top_scores, top_indices = torch.topk(similarities, top_n)
+                    for score, idx in zip(top_scores.tolist(), top_indices.tolist()):
+                        candidate_pool.add(idx)
+                        candidate_scores[idx] = candidate_scores.get(idx, 0.0) + float(score) * 3.0
+                else:
+                    logger.warning(
+                        "Query/document embedding dimensions differ; falling back to lexical retrieval"
+                    )
+            except Exception as e:
+                logger.error(f"Semantic retrieval failed, using lexical fallback: {e}")
+
+        # lexical retrieval path
+        # Scan recent docs (where new training data lands) plus semantic pool.
+        lexical_window = min(len(self.documents), 6000)
+        start_idx = max(0, len(self.documents) - lexical_window)
+        for idx in range(start_idx, len(self.documents)):
+            candidate_pool.add(idx)
+
+        if not candidate_pool:
+            return self.documents[-top_k:]
+
+        for idx in candidate_pool:
+            candidate_scores[idx] = candidate_scores.get(idx, 0.0) + lexical_score(idx)
+
+        ranked = sorted(candidate_scores.items(), key=lambda x: x[1], reverse=True)
+        best_indices = [idx for idx, score in ranked if score > 0][:top_k]
+
+        if not best_indices:
+            # fallback to latest documents instead of oldest ones
+            return self.documents[-top_k:]
+
+        return [self.documents[idx] for idx in best_indices]
 
     def _save_conversation(self):
         """Save conversation history to file"""

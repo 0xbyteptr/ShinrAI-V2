@@ -79,6 +79,13 @@ Fill in `discord_config.json`, then run:
 python dc.py
 ```
 
+The bot now supports both prefix commands and slash commands:
+
+- Prefix: `!chat`, `!stats`, `!status`, `!info`, `!memory`, `!clear`
+- Slash: `/chat`, `/stats`, `/status`, `/info`, `/memory`, `/clear`, `/summarize`
+
+Live status/presence is updated automatically with message and document counts.
+
 ## 7) Improved workflow helper
 
 Instead of running multiple commands manually, use:

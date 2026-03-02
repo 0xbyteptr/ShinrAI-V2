@@ -91,6 +91,14 @@ class ResponseGenerator:
                 "Glad I could assist!",
                 "You're welcome! Feel free to ask more questions."
             ],
+
+            'quote': [
+                "The best way to predict the future is to create it.",
+                "Progress is built one small step at a time.",
+                "Learning never exhausts the mind.",
+                "Simplicity is the soul of efficiency.",
+                "Code is read far more often than it is written."
+            ],
             
             # Acknowledgment
             'acknowledgment': [
@@ -221,6 +229,12 @@ class ResponseGenerator:
         if 'summarize' in query and 'knowledge' in query:
             return self._summarize_knowledge(knowledge_graph)
 
+        # Quote requests (including common typo: "quoute") should bypass
+        # normal retrieval to avoid returning random corpus questions.
+        if re.search(r'\b(quote|quoute|quotation)\b', query):
+            if any(token in query for token in ['random', 'give me', 'tell me', 'provide', 'send']):
+                return self._get_random_quote(context)
+
         # Topic summary requests (e.g. "summarize X") should not fall through
         # to greeting/farewell detection.
         if re.match(r'^summari[sz]e\b', query):
@@ -295,6 +309,28 @@ class ResponseGenerator:
             )
         
         return None
+
+    def _get_random_quote(self, context: List[str]) -> str:
+        """Return a short quote-like sentence from context or fallback list."""
+        candidates = []
+        if context:
+            for doc in context[:3]:
+                for sentence in sent_tokenize(doc):
+                    cleaned = self._clean_text(sentence).strip()
+                    if len(cleaned) < 35 or len(cleaned) > 180:
+                        continue
+                    if '?' in cleaned or '`' in cleaned:
+                        continue
+                    alpha_chars = sum(ch.isalpha() for ch in cleaned)
+                    if alpha_chars < max(20, int(len(cleaned) * 0.6)):
+                        continue
+                    candidates.append(cleaned)
+
+        if candidates:
+            quote = random.choice(candidates)
+            return f'"{quote}"'
+
+        return f'"{random.choice(self.response_templates["quote"])}"'
 
     def _is_unhelpful_context(self, context: List[str]) -> bool:
         """Return True if the provided context is empty or looks like JSON/data.
