@@ -1,0 +1,6 @@
+data/
+__pycache__/
+.venv/
+discord_config.json
+conversations.json
+shinrai_model/

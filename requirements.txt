@@ -1,0 +1,16 @@
+torch
+sentence-transformers
+transformers
+scikit-learn
+numpy
+nltk
+textblob
+networkx
+requests
+beautifulsoup4
+cloudscraper
+pdfplumber
+PyPDF2
+discord.py>=2.3.0
+asyncio>=3.4.3
+psutil
