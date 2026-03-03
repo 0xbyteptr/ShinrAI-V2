@@ -20,6 +20,7 @@ import hashlib
 # Add Shinrai to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from shinrai.core import Shinrai
+from shinrai.image import IMAGE_SENTINEL
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -373,28 +374,70 @@ class ShinraiDiscordBot:
             self.stats['commands_used'] += 1
 
         @self.bot.tree.command(name="chat", description="Chat with Shinrai")
+        @app_commands.allowed_installs(guilds=True, users=True)
+        @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
         async def slash_chat(interaction: discord.Interaction, message: str):
             await interaction.response.defer(thinking=True)
             response = await self.get_ai_response(message, interaction)
-            await self._send_long_interaction(interaction, response)
+            if response.startswith(IMAGE_SENTINEL):
+                img_path = response[len(IMAGE_SENTINEL):]
+                try:
+                    await interaction.followup.send(file=discord.File(img_path))
+                except Exception as e:
+                    await interaction.followup.send(f"❌ Could not send image: {e}")
+            else:
+                await self._send_long_interaction(interaction, response)
+            self.stats['slash_commands_used'] += 1
+
+        @self.bot.tree.command(name="imagine", description="Generate an image with Shinrai")
+        @app_commands.allowed_installs(guilds=True, users=True)
+        @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+        async def slash_imagine(interaction: discord.Interaction, prompt: str):
+            await interaction.response.defer(thinking=True)
+            loop = asyncio.get_event_loop()
+            async with self.shinrai_lock:
+                response = await loop.run_in_executor(
+                    None,
+                    self.shinrai.response_generator.image_generator.generate,
+                    prompt,
+                )
+            if response.startswith(IMAGE_SENTINEL):
+                img_path = response[len(IMAGE_SENTINEL):]
+                try:
+                    await interaction.followup.send(
+                        content=f"🎨 Here's your image for: *{prompt}*",
+                        file=discord.File(img_path),
+                    )
+                except Exception as e:
+                    await interaction.followup.send(f"❌ Could not send image: {e}")
+            else:
+                await interaction.followup.send(response)
             self.stats['slash_commands_used'] += 1
 
         @self.bot.tree.command(name="stats", description="Show bot stats")
+        @app_commands.allowed_installs(guilds=True, users=True)
+        @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
         async def slash_stats(interaction: discord.Interaction):
             await interaction.response.send_message(embed=self._build_stats_embed())
             self.stats['slash_commands_used'] += 1
 
         @self.bot.tree.command(name="status", description="Show live bot status")
+        @app_commands.allowed_installs(guilds=True, users=True)
+        @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
         async def slash_status(interaction: discord.Interaction):
             await interaction.response.send_message(embed=self._build_status_embed())
             self.stats['slash_commands_used'] += 1
 
         @self.bot.tree.command(name="info", description="Show model and corpus info")
+        @app_commands.allowed_installs(guilds=True, users=True)
+        @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
         async def slash_info(interaction: discord.Interaction):
             await interaction.response.send_message(embed=self._build_info_embed())
             self.stats['slash_commands_used'] += 1
 
         @self.bot.tree.command(name="clear", description="Clear your conversation history")
+        @app_commands.allowed_installs(guilds=True, users=True)
+        @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
         async def slash_clear(interaction: discord.Interaction):
             user_id = str(interaction.user.id)
             if user_id in self.conversations:
@@ -404,6 +447,8 @@ class ShinraiDiscordBot:
             self.stats['slash_commands_used'] += 1
 
         @self.bot.tree.command(name="memory", description="Show your recent conversation")
+        @app_commands.allowed_installs(guilds=True, users=True)
+        @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
         async def slash_memory(interaction: discord.Interaction):
             user_id = str(interaction.user.id)
             if user_id not in self.conversations or not self.conversations[user_id]:
@@ -417,12 +462,16 @@ class ShinraiDiscordBot:
             self.stats['slash_commands_used'] += 1
 
         @self.bot.tree.command(name="summarize", description="Summarize learned knowledge")
+        @app_commands.allowed_installs(guilds=True, users=True)
+        @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
         async def slash_summarize(interaction: discord.Interaction):
             summary = self.shinrai.response_generator._summarize_knowledge(self.shinrai.knowledge_graph)
             await interaction.response.send_message(summary)
             self.stats['slash_commands_used'] += 1
 
         @self.bot.tree.command(name="learn_status", description="Show channel-learning status")
+        @app_commands.allowed_installs(guilds=True, users=True)
+        @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
         async def slash_learn_status(interaction: discord.Interaction):
             embed = discord.Embed(title="🧠 Auto Learning Status", color=discord.Color.teal())
             embed.add_field(name="Enabled", value=str(self.config.get('auto_learn_from_channels', False)), inline=True)
@@ -743,9 +792,22 @@ class ShinraiDiscordBot:
         # Show typing indicator
         async with message.channel.typing():
             response = await self.get_ai_response(content, message)
-            
-            # Send response
-            await self.send_long_message(message.channel, response, reference=message)
+
+            # Check if Shinrai generated an image
+            if response.startswith(IMAGE_SENTINEL):
+                img_path = response[len(IMAGE_SENTINEL):]
+                try:
+                    await message.channel.send(
+                        file=discord.File(img_path),
+                        reference=message,
+                    )
+                except Exception as e:
+                    await message.channel.send(
+                        f"❌ Could not send image: {e}",
+                        reference=message,
+                    )
+            else:
+                await self.send_long_message(message.channel, response, reference=message)
         
         # Set cooldown
         self.cooldowns[user_id] = datetime.now() + timedelta(seconds=self.config['cooldown'])

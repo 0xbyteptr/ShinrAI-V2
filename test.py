@@ -69,29 +69,26 @@ def main():
         # store last context to allow provenance checks when the query itself is a follow-up
         last_context = relevant_docs
 
+        # Generate response
+        response = shinrai.response_generator.generate(
+            query,
+            relevant_docs,
+            shinrai.conversation_memory,
+            shinrai.knowledge_graph
+        )
+        shinrai.conversation_memory.add_interaction(query, response)
+        print(f"🤖 Shinrai: {response}")
+
     # make a follow-up query using the previous response context
-    print("\n👤 You: how do you know that?")
+    followup = "how do you know that?"
+    print(f"\n👤 You: {followup}")
     response = shinrai.response_generator.generate(
-        "how do you know that?",
+        followup,
         last_context,
         shinrai.conversation_memory,
         shinrai.knowledge_graph
     )
     print(f"🤖 Shinrai: {response}")
-        
-        # Generate response
-        # response = shinrai.response_generator.generate(
-        #     query,
-        #     relevant_docs,
-        #     shinrai.conversation_memory,
-        #     shinrai.knowledge_graph
-        # )
-        
-        # print(f"🤖 Shinrai: {response}")
-        
-        # # Small delay between queries
-        # import time
-        # time.sleep(1)
 
 if __name__ == "__main__":
     main()

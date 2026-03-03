@@ -16,8 +16,19 @@ from sklearn.decomposition import LatentDirichletAllocation
 from .memory import ConversationMemory
 from .knowledge import KnowledgeGraph
 from .response import ResponseGenerator
+from .image import IMAGE_SENTINEL
 from .scraper import WebScraper
 from .utils import DEVICE, logger
+# LLM components (lazy import to keep startup fast)
+try:
+    from .llm_tokenizer import BPETokenizer
+    from .llm_model import GPT, GPTConfig
+    from .llm_trainer import LLMTrainer, TrainerConfig
+    from .llm_generate import LLMGenerator
+    _LLM_AVAILABLE = True
+except ImportError as _llm_import_err:
+    _LLM_AVAILABLE = False
+    logger.debug(f"LLM modules not available: {_llm_import_err}")
 
 
 class _HFEncoderFallback:
@@ -31,8 +42,17 @@ class _HFEncoderFallback:
     def __init__(self, model_name: str = 'bert-base-uncased'):
         from transformers import AutoModel, AutoTokenizer
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModel.from_pretrained(model_name).to(DEVICE)
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_name, local_files_only=True
+            )
+            self.model = AutoModel.from_pretrained(
+                model_name, local_files_only=True
+            ).to(DEVICE)
+        except (OSError, EnvironmentError):
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            self.model = AutoModel.from_pretrained(model_name).to(DEVICE)
+
         self.model.eval()
         self.device = DEVICE
 
@@ -102,7 +122,10 @@ class Shinrai:
         self.document_metadata = []
         self.conversation_memory = ConversationMemory(offload_path=self.offload_file)
         self.knowledge_graph = KnowledgeGraph()
-        self.response_generator = ResponseGenerator()
+        # Place generated images alongside the model for easy discovery
+        self.response_generator = ResponseGenerator(
+            image_output_dir=str(self.model_path / "generated_images")
+        )
         self.web_scraper = WebScraper()
 
         # Embeddings and models (initialized lazily)
@@ -115,6 +138,11 @@ class Shinrai:
         # track whether we've performed expensive setup
         self._models_initialized = False
         self._model_data_loaded = False
+
+        # LLM (GPT) components — loaded on demand
+        self.llm_model: "GPT | None" = None
+        self.llm_tokenizer: "BPETokenizer | None" = None
+        self.llm_generator: "LLMGenerator | None" = None
 
         if not lazy:
             # regular behaviour: build everything now
@@ -152,24 +180,29 @@ class Shinrai:
         # though we don't need vision features for text embeddings.
         os.environ.setdefault('TRANSFORMERS_NO_TORCHVISION', '1')
 
-        # load the sentence transformer; failure shouldn't prevent tokenizer
+        # load the sentence transformer; failure shouldn't prevent tokenizer.
+        # We always try the local HuggingFace cache first (local_files_only=True)
+        # to avoid network HEAD requests on every launch.  Only if the cache is
+        # empty (OSError / EnvironmentError) do we fall back to a one-time
+        # online download.
         model_name = 'sentence-transformers/all-MiniLM-L6-v2'
         try:
             from sentence_transformers import SentenceTransformer
 
-            load_kwargs = {}
-            if os.environ.get('TRANSFORMERS_OFFLINE') or os.environ.get('HF_LOCAL_FILES_ONLY'):
-                load_kwargs['local_files_only'] = True
-
             try:
-                self.transformer_model = SentenceTransformer(model_name, **load_kwargs)
-            except Exception as e:
-                # if offline load fails because nothing is cached, try again online
-                logger.debug(f"offline load failed ({e}), retrying online")
+                self.transformer_model = SentenceTransformer(
+                    model_name, local_files_only=True
+                )
+                logger.info(f"Loaded transformer model from cache: {model_name}")
+            except (OSError, EnvironmentError):
+                # Cache miss — download once and store for future launches.
+                logger.info(
+                    f"Cache miss for {model_name}; downloading (this happens once)…"
+                )
                 self.transformer_model = SentenceTransformer(model_name)
+                logger.info(f"Downloaded and cached transformer model: {model_name}")
 
             self.transformer_model = self.transformer_model.to(DEVICE)
-            logger.info(f"Loaded transformer model: {model_name}")
         except Exception as e:
             logger.error(f"Error loading sentence transformer: {e}")
             self.transformer_model = None
@@ -182,14 +215,22 @@ class Shinrai:
                 logger.error(f"Error loading fallback HF encoder: {fallback_error}")
                 self.transformer_model = None
 
-        # load tokenizer separately so that transformer failures don't block it
+        # load tokenizer separately so that transformer failures don't block it.
+        # Same cache-first approach: try local_files_only, download only on miss.
+        tokenizer_name = 'bert-base-uncased'
         try:
             from transformers import AutoTokenizer
-            tok_kwargs = {}
-            if os.environ.get('TRANSFORMERS_OFFLINE') or os.environ.get('HF_LOCAL_FILES_ONLY'):
-                tok_kwargs['local_files_only'] = True
-            self.tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased', **tok_kwargs)
-            logger.info("Loaded tokenizer: bert-base-uncased")
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    tokenizer_name, local_files_only=True
+                )
+                logger.info(f"Loaded tokenizer from cache: {tokenizer_name}")
+            except (OSError, EnvironmentError):
+                logger.info(
+                    f"Cache miss for tokenizer {tokenizer_name}; downloading (this happens once)…"
+                )
+                self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+                logger.info(f"Downloaded and cached tokenizer: {tokenizer_name}")
         except Exception as e:
             logger.error(f"Error loading tokenizer: {e}")
             self.tokenizer = None
@@ -266,7 +307,11 @@ class Shinrai:
             if not texts:
                 logger.warning(f"No text loaded from directory {data_source}")
         elif source_type == 'hf_dataset':
-            texts = self._load_from_hf_dataset(data_source, max_rows=kwargs.get('max_rows', 2000))
+            texts = self._load_from_hf_dataset(
+                data_source,
+                max_rows=kwargs.get('max_rows', 2000),
+                hf_token=kwargs.get('hf_token'),
+            )
             if not texts:
                 logger.warning(f"No text loaded from Hugging Face dataset source {data_source}")
         else:
@@ -338,7 +383,7 @@ class Shinrai:
             return f"{parts[0]}/{parts[1]}"
         return ''
 
-    def _load_from_hf_dataset(self, source: str, max_rows: int = 2000) -> List[str]:
+    def _load_from_hf_dataset(self, source: str, max_rows: int = 2000, hf_token: str = None) -> List[str]:
         """Load text rows from a Hugging Face dataset via datasets-server API."""
         dataset_id = self._normalize_hf_dataset_id(source)
         if not dataset_id:
@@ -350,6 +395,15 @@ class Shinrai:
 
         texts: List[str] = []
         session = requests.Session()
+        if hf_token:
+            session.headers.update({"Authorization": f"Bearer {hf_token}"})
+            logger.info("Using Hugging Face token for authenticated access")
+        else:
+            import os as _os
+            _env_token = _os.environ.get('HF_TOKEN') or _os.environ.get('HUGGING_FACE_HUB_TOKEN')
+            if _env_token:
+                session.headers.update({"Authorization": f"Bearer {_env_token}"})
+                logger.info("Using Hugging Face token from environment for authenticated access")
 
         try:
             splits_resp = session.get(
@@ -357,6 +411,15 @@ class Shinrai:
                 params={"dataset": dataset_id},
                 timeout=30,
             )
+            if splits_resp.status_code == 401:
+                logger.error(
+                    f"Access denied (401) for dataset {dataset_id}. "
+                    "This is a gated dataset — accept its terms on "
+                    "https://huggingface.co/datasets/%s "
+                    "then pass your token via --hf-token <TOKEN> or the HF_TOKEN env var.",
+                    dataset_id,
+                )
+                return []
             splits_resp.raise_for_status()
             splits_data = splits_resp.json()
             splits = splits_data.get('splits', [])
@@ -671,6 +734,8 @@ class Shinrai:
             cleaned.append(t2)
         return cleaned
 
+    _TOPIC_SAMPLE_LIMIT = 5000  # max docs used to fit the topic model
+
     def _train_topic_model(self, texts: List[str]):
         """Train topic model on documents.
 
@@ -679,17 +744,32 @@ class Shinrai:
         optional `cuml` package from RAPIDS is installed we will instead run
         the model on the GPU, which can significantly reduce CPU usage and
         make training overlap with the embedding step.
+
+        To keep training fast the model is always fitted on a random sample of
+        at most ``_TOPIC_SAMPLE_LIMIT`` documents even when the full corpus is
+        larger.  The TF-IDF vectorizer is then *only* fitted on that same
+        sample so that its vocabulary stays manageable.
         """
+        import random as _random
+
         logger.info("Training topic model...")
 
         # clean the corpus before vectorizing in order to avoid junk topics
         safe_texts = self._clean_texts_for_topics(texts)
 
-        # Create TF-IDF vectors
+        # Sample to keep CPU cost reasonable on large corpora
+        if len(safe_texts) > self._TOPIC_SAMPLE_LIMIT:
+            logger.info(
+                f"Corpus has {len(safe_texts)} documents; sampling "
+                f"{self._TOPIC_SAMPLE_LIMIT} for topic model training"
+            )
+            safe_texts = _random.sample(safe_texts, self._TOPIC_SAMPLE_LIMIT)
+
+        # Create TF-IDF vectors (unigrams only keeps the matrix small)
         self.tfidf_vectorizer = TfidfVectorizer(
-            max_features=10000,
+            max_features=5000,
             stop_words='english',
-            ngram_range=(1, 2)
+            ngram_range=(1, 1),
         )
 
         tfidf_matrix = self.tfidf_vectorizer.fit_transform(safe_texts)
@@ -708,7 +788,7 @@ class Shinrai:
             self.topic_model = cuLDA(
                 n_components=20,
                 random_state=42,
-                max_iter=10
+                max_iter=10,
             )
             try:
                 self.topic_model.fit(tfidf_gpu)
@@ -717,14 +797,16 @@ class Shinrai:
                 self.topic_model = LatentDirichletAllocation(
                     n_components=20,
                     random_state=42,
-                    max_iter=10
+                    max_iter=10,
+                    n_jobs=-1,
                 )
                 self.topic_model.fit(tfidf_matrix)
         else:
             self.topic_model = LatentDirichletAllocation(
                 n_components=20,
                 random_state=42,
-                max_iter=10
+                max_iter=10,
+                n_jobs=-1,
             )
             self.topic_model.fit(tfidf_matrix)
 
@@ -767,7 +849,9 @@ class Shinrai:
                 logger.info(f"Processing query: {user_input[:50]}...")
 
                 # Get relevant context
-                relevant_docs = self._get_relevant_documents(user_input)
+                relevant_docs = self._get_relevant_documents(
+                    user_input, conversation_memory=self.conversation_memory
+                )
 
                 # Generate response
                 response = self.response_generator.generate(
@@ -780,8 +864,20 @@ class Shinrai:
                 # Store in memory
                 self.conversation_memory.add_interaction(user_input, response)
 
-                # Print response
-                print(f"\n🤖 Shinrai: {response}")
+                # Print response — handle image sentinel specially
+                if response.startswith(IMAGE_SENTINEL):
+                    img_path = response[len(IMAGE_SENTINEL):]
+                    print(f"\n🎨 Shinrai: Image saved to: {img_path}")
+                    # Try to open the image with the system viewer
+                    try:
+                        import subprocess
+                        subprocess.Popen(["xdg-open", img_path],
+                                         stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL)
+                    except Exception:
+                        pass
+                else:
+                    print(f"\n🤖 Shinrai: {response}")
 
             except KeyboardInterrupt:
                 print("\n\n👋 Goodbye!")
@@ -837,21 +933,48 @@ class Shinrai:
             print("👋 Goodbye!")
             sys.exit(0)
 
-    def _get_relevant_documents(self, query: str, top_k: int = 5) -> List[str]:
+    def _get_relevant_documents(self, query: str, top_k: int = 8,
+                                conversation_memory=None) -> List[str]:
         """Get most relevant documents for query using hybrid retrieval.
 
         We combine semantic similarity (when available) with lexical overlap
         and metadata URL boosts to avoid drifting into unrelated old documents
         in large mixed corpora.
+
+        Parameters
+        ----------
+        query:
+            The user's input string.
+        top_k:
+            Number of documents to return.
+        conversation_memory:
+            Optional :class:`ConversationMemory` instance.  When supplied,
+            recent topics are used to expand the search query so that
+            follow-up questions benefit from prior conversational context.
         """
         self._ensure_models()
 
         if not self.documents:
             return []
 
-        query_terms = [t for t in re.findall(r"[a-z0-9]+", query.lower()) if len(t) >= 3]
+        # --- query expansion using conversation history -------------------
+        expanded_query = query
+        if conversation_memory is not None:
+            try:
+                summary = conversation_memory.get_summary()
+                recent_topics = summary.get('main_topics', [])[:4]
+                if recent_topics:
+                    # only append topics not already in the query
+                    q_lower = query.lower()
+                    extra = [t for t in recent_topics if t.lower() not in q_lower]
+                    if extra:
+                        expanded_query = query + " " + " ".join(extra)
+            except Exception:
+                pass
+
+        query_terms = [t for t in re.findall(r"[a-z0-9]+", expanded_query.lower()) if len(t) >= 3]
         query_term_set = set(query_terms)
-        raw_query = query.lower().strip()
+        raw_query = expanded_query.lower().strip()
 
         # document_metadata typically corresponds to the most recently appended
         # web documents; map indices carefully when lengths differ.
@@ -900,7 +1023,7 @@ class Shinrai:
         # semantic retrieval path (if available)
         if self.transformer_model is not None and self.embeddings is not None:
             try:
-                query_embedding = self.transformer_model.encode([query], convert_to_tensor=True)
+                query_embedding = self.transformer_model.encode([expanded_query], convert_to_tensor=True)
                 query_embedding = query_embedding.to(DEVICE)
 
                 # protect against embedding dimension mismatches
@@ -932,13 +1055,224 @@ class Shinrai:
             candidate_scores[idx] = candidate_scores.get(idx, 0.0) + lexical_score(idx)
 
         ranked = sorted(candidate_scores.items(), key=lambda x: x[1], reverse=True)
-        best_indices = [idx for idx, score in ranked if score > 0][:top_k]
+        best_indices = [idx for idx, score in ranked if score > 0][:top_k * 2]
 
         if not best_indices:
             # fallback to latest documents instead of oldest ones
             return self.documents[-top_k:]
 
-        return [self.documents[idx] for idx in best_indices]
+        # deduplicate: skip document whose first 120 chars are near-identical to
+        # one already selected (avoids returning the same paragraph twice).
+        selected = []
+        seen_prefixes: set = set()
+        for idx in best_indices:
+            prefix = self.documents[idx][:120].strip().lower()
+            if prefix not in seen_prefixes:
+                selected.append(self.documents[idx])
+                seen_prefixes.add(prefix)
+            if len(selected) >= top_k:
+                break
+
+        return selected
+
+    # ── LLM public API ────────────────────────────────────────────────────────
+
+    def llm_train(
+        self,
+        vocab_size: int = 16000,
+        epochs: int = 3,
+        batch_size: int = 8,
+        seq_len: int = 512,
+        lr: float = 3e-4,
+        model_size: str = "small",
+    ):
+        """Train a GPT language model from scratch on the existing document corpus.
+
+        Parameters
+        ----------
+        vocab_size  : BPE vocabulary size (must be ≥ 4 for special tokens).
+        epochs      : Number of passes over the training windows.
+        batch_size  : Sequences per gradient update.
+        seq_len     : Context window length (tokens).
+        lr          : Peak learning rate for AdamW.
+        model_size  : ``'small'`` (~45M params) or ``'medium'`` (~125M params).
+        """
+        if not _LLM_AVAILABLE:
+            logger.error("LLM modules not loaded — cannot run llm_train.")
+            return
+
+        self._ensure_models()
+        if not self.documents:
+            logger.warning("No documents in corpus. Run train first to add data.")
+            return
+
+        llm_dir = str(self.model_path / "llm")
+        tok_path = str(self.model_path / "llm" / "llm_tokenizer.json")
+
+        # ── tokenizer ────────────────────────────────────────────────────────
+        import os as _os
+        if _os.path.exists(tok_path):
+            logger.info(f"Loading existing BPE tokenizer from {tok_path}")
+            tokenizer = BPETokenizer.load(tok_path)
+        else:
+            logger.info(
+                f"Training BPE tokenizer (vocab_size={vocab_size}) "
+                f"on {len(self.documents):,} documents …"
+            )
+            tokenizer = BPETokenizer(vocab_size=vocab_size)
+            tokenizer.train(self.documents, verbose=True)
+            _os.makedirs(llm_dir, exist_ok=True)
+            tokenizer.save(tok_path)
+            logger.info(f"BPE tokenizer saved → {tok_path}")
+
+        # ── model ─────────────────────────────────────────────────────────────
+        ckpt_path = str(self.model_path / "llm" / "llm_final.pt")
+        if _os.path.exists(ckpt_path):
+            logger.info("Found existing LLM checkpoint — continuing training.")
+            model, _ = LLMTrainer.load_model_from(
+                llm_dir, tag="final", device=str(DEVICE)
+            )
+        else:
+            logger.info(f"Creating new GPT ({model_size}) with vocab_size={len(tokenizer)}")
+            real_vocab = len(tokenizer)
+            if model_size == "medium":
+                model = GPT.medium(vocab_size=real_vocab)
+            else:
+                model = GPT.small(vocab_size=real_vocab)
+            logger.info(f"GPT model: {model.num_params() / 1e6:.1f}M parameters")
+
+        # ── training ──────────────────────────────────────────────────────────
+        cfg = TrainerConfig(
+            epochs=epochs,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            lr=lr,
+            warmup_steps=min(200, len(self.documents) // batch_size),
+        )
+        trainer = LLMTrainer(model, tokenizer, cfg, device=str(DEVICE))
+        trainer.train(self.documents, save_dir=llm_dir)
+
+        # cache for immediate use
+        self.llm_tokenizer = tokenizer
+        self.llm_model = model
+        self.llm_generator = LLMGenerator(model, tokenizer, device=str(DEVICE))
+        logger.info("LLM training complete and model cached in memory.")
+
+    def _load_llm(self) -> bool:
+        """Attempt to load a previously trained LLM from disk."""
+        if not _LLM_AVAILABLE:
+            return False
+        llm_dir = str(self.model_path / "llm")
+        tok_path = str(self.model_path / "llm" / "llm_tokenizer.json")
+        ckpt_path = str(self.model_path / "llm" / "llm_final.pt")
+        import os as _os
+        if not (_os.path.exists(ckpt_path) and _os.path.exists(tok_path)):
+            return False
+        try:
+            logger.info("Loading LLM from disk …")
+            tokenizer = BPETokenizer.load(tok_path)
+            model, step = LLMTrainer.load_model_from(llm_dir, tag="final", device=str(DEVICE))
+            self.llm_tokenizer = tokenizer
+            self.llm_model = model
+            self.llm_generator = LLMGenerator(model, tokenizer, device=str(DEVICE))
+            logger.info(
+                f"LLM loaded (step {step}, "
+                f"{model.num_params() / 1e6:.1f}M params, "
+                f"vocab {len(tokenizer)})"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load LLM: {e}")
+            return False
+
+    def _ensure_llm(self) -> bool:
+        """Return True if the LLM is ready, trying to load from disk if needed."""
+        if self.llm_generator is not None:
+            return True
+        return self._load_llm()
+
+    def llm_chat(
+        self,
+        max_new_tokens: int = 256,
+        temperature: float = 0.8,
+        top_k: int = 50,
+        top_p: float = 0.95,
+        use_rag: bool = True,
+    ):
+        """Interactive chat session powered by the trained GPT model.
+
+        Parameters
+        ----------
+        max_new_tokens : max tokens to generate per turn.
+        temperature    : sampling temperature.
+        top_k          : top-k token filter.
+        top_p          : nucleus sampling threshold.
+        use_rag        : if True, retrieve relevant docs and inject as context.
+        """
+        if not self._ensure_llm():
+            print(
+                "\n❌ No trained LLM found. "
+                "Run: py shinrai.py llm-train  first."
+            )
+            return
+
+        self._ensure_models()
+
+        print("\n" + "=" * 70)
+        print("🧠 Shinrai LLM — GPT generative chat")
+        print("=" * 70)
+        print(f"Model : {self.llm_model.num_params() / 1e6:.1f}M params")
+        print(f"Vocab : {len(self.llm_tokenizer):,} tokens")
+        print(f"Device: {DEVICE}")
+        print(f"RAG   : {'enabled' if use_rag else 'disabled'}")
+        print("Type /exit to quit, /clear to reset memory.")
+        print("=" * 70)
+
+        while True:
+            try:
+                user_input = input("\n👤 You: ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print("\n\n👋 Goodbye!")
+                break
+
+            if not user_input:
+                continue
+
+            if user_input.startswith("/"):
+                cmd = user_input[1:].strip().lower()
+                if cmd in ("exit", "quit"):
+                    print("👋 Goodbye!")
+                    break
+                if cmd == "clear":
+                    self.conversation_memory = ConversationMemory(
+                        offload_path=self.offload_file
+                    )
+                    print("🧹 Memory cleared.")
+                    continue
+                print(f"Unknown command: /{cmd}")
+                continue
+
+            # optionally retrieve context
+            context_docs = None
+            if use_rag and self.documents:
+                context_docs = self._get_relevant_documents(
+                    user_input, top_k=3,
+                    conversation_memory=self.conversation_memory,
+                )
+
+            response = self.llm_generator.generate(
+                user_input,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                context_docs=context_docs,
+            )
+
+            self.conversation_memory.add_interaction(user_input, response)
+            print(f"\n🤖 Shinrai: {response}")
+
+    # ── end LLM API ───────────────────────────────────────────────────────────
 
     def _save_conversation(self):
         """Save conversation history to file"""
